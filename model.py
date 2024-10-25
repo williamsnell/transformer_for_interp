@@ -3,6 +3,7 @@ import torch as t
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.data import DataLoader
 from jaxtyping import Float, Int
 from typing import Literal
 import einops
@@ -16,7 +17,9 @@ from tqdm import tqdm
 from itertools import product
 
 t.set_printoptions(precision=2, linewidth=160)
+t.multiprocessing.set_sharing_strategy('file_system')
 
+device = 'cuda' if t.cuda.is_available() else 'cpu'
 
 Activation = Literal["relu"]
 
@@ -39,7 +42,6 @@ class Transformer(nn.Module):
 
         self.cfg = cfg
 
-        # TODO: change these from matmul to indexing
         self.embed = Embedding(cfg.d_vocab, cfg.d_model)
         self.pos_embed = Embedding(cfg.context_length, cfg.d_model)
 
@@ -55,6 +57,8 @@ class Transformer(nn.Module):
         # training parameters
         self.loss = nn.CrossEntropyLoss()
         self.optimizer = t.optim.AdamW(self.parameters())
+
+        self.to(device)
 
     def forward(self, x: Int[Tensor, "... seq"]
                 ) -> Float[Tensor, "... seq d_vocab"]:
@@ -74,9 +78,8 @@ class Transformer(nn.Module):
         prediction = self(x[..., :-1]) # exclude the last token
                                    # since we can't evaluate
                                    # its prediction
-
         # we use tokens[0 : -1] to predict tokens[1 : end]    
-        loss = self.loss(input=prediction, target=x[1:])
+        loss = self.loss(input=prediction.swapaxes(1, 2), target=x[..., 1:])
 
         # we may actually want to sum or do something else
         return loss.mean()
@@ -88,14 +91,14 @@ class Transformer(nn.Module):
 
         for epoch, batch in tqdm(product(
                 range(epochs), 
-                range(len(dataset) // token_chunk_size))):
-            tokens = dataset[batch * token_chunk_size : (batch + 1) * token_chunk_size]
-            tokens = t.tensor(tokens).reshape(batch_size, self.cfg.context_length)
-                
+                dataset)):
             self.optimizer.zero_grad()
+
+            tokens = batch['input_ids'].to(device)
             loss = self.calc_loss(tokens)
-            print(f"{loss=}")
             loss.backward()
+            
+            tqdm.write(f"{loss=}, {epoch=}")
 
             self.optimizer.step()
 
@@ -173,7 +176,7 @@ class AttentionBlock(nn.Module):
 
         attention_dot = einops.einsum(q, k,
                           "... qseq n_heads d_head, ... kseq n_heads d_head -> ... n_heads qseq kseq")
-        attention_masked = attention_dot + t.triu(-t.inf * t.ones(*attention_dot.shape[-3:]), diagonal=1)
+        attention_masked = attention_dot + t.triu(-t.inf * t.ones(*attention_dot.shape[-3:], device=device), diagonal=1)
         attention_score = attention_masked.softmax(dim=-2)
 
         z = einops.einsum(attention_score, v,
@@ -214,6 +217,7 @@ class MLP(nn.Module):
 
 if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
     vocab_size = tokenizer.vocab_size
 
     cfg = TransformerConfig(
@@ -229,14 +233,24 @@ if __name__ == '__main__':
             )
 
     model = Transformer(cfg)
+    
+    checkpoint = t.load("./checkpoint_9.pt", weights_only=True)
+    model.load_state_dict(checkpoint['model_state_dict'])
 
-    print(model((t.rand(10) * vocab_size).int()))
+#    print(model((t.rand(10) * vocab_size).int()))
+#
+#    ds = load_dataset("stas/openwebtext-10k", streaming=True)
+#    
+#    def encode(examples):
+#        return tokenizer(examples['text'], truncation=True, max_length=cfg.context_length, padding="max_length",
+#                         return_tensors="pt")
+#
+#    tokenized_dataset = ds["train"].map(encode, remove_columns=ds["train"].column_names, batched=True)
+#
+#    dataloader = DataLoader(
+#            tokenized_dataset, batch_size=32, collate_fn=lambda examples: {"input_ids": t.stack([example["input_ids"] for example in examples])},
+#            num_workers=4)
+#
+#    
+#    model.train(epochs=10, batch_size=10, dataset=dataloader)
 
-    ds = load_dataset("stas/openwebtext-10k")
-
-    def encode(examples):
-        return tokenizer(examples['text'])
-
-    ds = ds.map(encode, batched=True)
-
-    model.train(epochs=5, batch_size=10, dataset=ds['train']['input_ids'])
