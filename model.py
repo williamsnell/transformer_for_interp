@@ -84,6 +84,8 @@ class Transformer(nn.Module):
     def train(self, batch_size: int, epochs: int, dataset: Tensor):
         token_chunk_size = batch_size * self.cfg.context_length
 
+        last_save_epoch = -1
+
         for epoch, batch in tqdm(product(
                 range(epochs), 
                 range(len(dataset) // token_chunk_size))):
@@ -96,6 +98,17 @@ class Transformer(nn.Module):
             loss.backward()
 
             self.optimizer.step()
+
+            if last_save_epoch < epoch:
+                t.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': loss}, f"./checkpoint_{epoch}.pt")
+                last_save_epoch += 1
+
+
+
 
 
 
